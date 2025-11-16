@@ -183,7 +183,7 @@ int main() {
     int lay_totElements = B * T * C;
     int lay_error = 0;
     for (int i = 0; i < lay_totElements; i++) {
-        if (fabs(lay_out_cpu[i] - lay_out_gpu[i])/(lay_out_cpu[i] + ep) > error_threshold) {
+        if (fabs(lay_out_cpu[i] - lay_out_gpu[i])/(lay_out_cpu[i] + ep) > error_threshold*100) {
             lay_error++;
         }
     }

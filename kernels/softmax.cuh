@@ -8,6 +8,8 @@
 // Implement this (to be used in attention_forward)
 __global__ void softmax_forward_kernel(float* out, float inv_temperature, const float* inp, int N, int T) {
 
+    
+
 }
 
 
