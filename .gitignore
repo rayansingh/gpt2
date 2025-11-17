@@ -1,0 +1,5 @@
+*bin
+gpt2
+gpt2.o
+output_verification
+output_verification.o

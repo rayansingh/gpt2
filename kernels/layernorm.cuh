@@ -5,8 +5,8 @@
 #include <assert.h>
 #include <float.h>
 
-#define WARPS_PER_EMB (128 / 32)
-#define BLOCK_SIZE (128)
+#define WARPS_PER_EMB (768 / 32)
+#define BLOCK_SIZE (768)
 
 // Implement this
 __global__ void layernorm_forward_kernel(float* out, float* mean, float* rstd,
@@ -35,7 +35,11 @@ __global__ void layernorm_forward_kernel(float* out, float* mean, float* rstd,
     __syncthreads();
 
     if (i == 0) {
-        accum = (warpSums[0] + warpSums[1] + warpSums[2] + warpSums[3]) / C;
+        accum = 0.0f;
+        for (int w = 0; w < WARPS_PER_EMB; w++) {
+            accum += warpSums[w];
+        }
+        accum /= C;
         _mean = accum;
         mean[blockIdx.x] = accum;
     }
@@ -59,7 +63,11 @@ __global__ void layernorm_forward_kernel(float* out, float* mean, float* rstd,
     __syncthreads();
 
     if (i == 0) {
-        accum = 1.0f / sqrtf((warpSums[0] + warpSums[1] + warpSums[2] + warpSums[3]) / BLOCK_SIZE + 1e-5f);
+        accum = 0.0f;
+        for (int w = 0; w < WARPS_PER_EMB; w++) {
+            accum += warpSums[w];
+        }
+        accum = 1.0f / sqrtf(accum / BLOCK_SIZE + 1e-5f);
         _std = accum;
         rstd[blockIdx.x] = accum;
     }

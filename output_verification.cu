@@ -44,7 +44,7 @@ int main() {
     
     const int B = 4; // Batch size
     const int T = 128; // Sequence length - needs to be divisible by 4
-    const int C = 128; // Input channels
+    const int C = 768; // Input channels
     const int OC = 4 * C; // Output channels
 
     const int NH = 12; // Number of heads

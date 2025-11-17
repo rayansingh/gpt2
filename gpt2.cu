@@ -8,15 +8,13 @@
 #include <unistd.h>
 
 // GPU / CUDA related
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils/utils.h"
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "utils/tokenizer.h"
-// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#include "utils/dataloader.h"
 // defines: cudaCheck, cublasCheck, cublas_handle, cublas_compute_type, CEIL_DIV
 #include "utils/cuda_utils.cuh"
 
@@ -312,8 +310,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 }
 
 
-void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
-
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+    // targets are optional and could be NULL
+    
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
@@ -345,7 +344,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int B, int T) {
         }
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        printf("allocated %zu MiB for activations\n", (num_activations * sizeof(float)) >> 20); // >> 20 is /(1024*1024)
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     } else {
@@ -436,120 +434,295 @@ void gpt2_free(GPT2 *model) {
 }
 
 #define GPT2_EOT 50256
+#define MAX_INPUT_LENGTH 1024
 
-
-// ----------------------------------------------------------------------------
-// Logger lite
-
-typedef struct {
-    FILE *logfile;
-    int flush_every; // every how many steps to flush the log
-} Logger;
-
-void logger_init(Logger *logger, const char *filename) {
-    logger->flush_every = 20;
-    logger->logfile = NULL;
-    if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
+unsigned int random_u32(unsigned long long *state) {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
 }
 
-void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
+float random_f32(unsigned long long *state) {
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample_softmax(const float* logits, int n, float coin) {
+    double norm = 0;
+    for (int i = 0; i < n; i++) {
+        norm += expf(logits[i]);
+    }
+    coin *= norm;
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += expf(logits[i]);
+        if (coin < cdf) {
+            return i;
+        }
+    }
+    // Fallback: return token with highest logit instead of last token (which is EOT!)
+    int best = 0;
+    for (int i = 1; i < n; i++) {
+        if (logits[i] > logits[best]) best = i;
+    }
+    return best;
+}
+
+int sample_argmax(const float* logits, int n) {
+    // Greedy sampling - just pick the most likely token
+    int max_i = 0;
+    float max_val = logits[0];
+    for (int i = 1; i < n; i++) {
+        if (logits[i] > max_val) {
+            max_val = logits[i];
+            max_i = i;
+        }
+    }
+    return max_i;
+}
+
+int sample_top_k(const float* logits, int n, int k, float coin) {
+    // Top-k sampling: only sample from the k most likely tokens
+    // First, find the k-th largest logit value
+    float* logits_copy = (float*)malloc(n * sizeof(float));
+    memcpy(logits_copy, logits, n * sizeof(float));
+    
+    // Partial sort to find k-th element
+    for (int i = 0; i < k; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (logits_copy[j] > logits_copy[i]) {
+                float tmp = logits_copy[i];
+                logits_copy[i] = logits_copy[j];
+                logits_copy[j] = tmp;
+            }
+        }
+    }
+    float threshold = logits_copy[k-1];
+    free(logits_copy);
+    
+    // Now sample only from tokens with logit >= threshold
+    double norm = 0;
+    for (int i = 0; i < n; i++) {
+        if (logits[i] >= threshold) {
+            norm += expf(logits[i]);
+        }
+    }
+    coin *= norm;
+    float cdf = 0.0f;
+    int last_valid_token = 0;
+    for (int i = 0; i < n; i++) {
+        if (logits[i] >= threshold) {
+            cdf += expf(logits[i]);
+            last_valid_token = i;
+            if (coin < cdf) {
+                return i;
+            }
+        }
+    }
+    // Return the last valid token if we somehow didn't sample one
+    return last_valid_token;
+}
+
+void softmax_forward_cpu_single(float* out, float inv_temperature, const float* inp, int T) {
+    float sumval = 0.0f;
+    for (int i = 0; i < T; i++) {
+        float ev = expf(inv_temperature * inp[i]);
+        sumval += ev;
+        out[i] = ev;
+    }
+    float norm = 1.0f / sumval;
+    for (int i = 0; i < T; ++i) {
+        out[i] *= norm;
     }
 }
 
-void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-        if (step % 10 == 0) { fflush(logger->logfile); }
-    }
-}
-
-void logger_free(Logger *logger) {
-    if (logger->logfile != NULL) { fclose(logger->logfile); }
-}
-
 // ----------------------------------------------------------------------------
-// CLI
-
-void error_usage() {
-    fprintf(stderr, "Usage:   ./gpt2 [options]\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
-    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
-    fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
-    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
-    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
-    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
-    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
-    fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
-    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
-    exit(EXIT_FAILURE);
-}
-
-// ----------------------------------------------------------------------------
-// main training loop
+// main inference loop
 int main(int argc, char *argv[]) {
-    printf("Starting 408 test now\n");
-    int B = 4; // batch size
-    int T = 1024; // sequence length max
-    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* output_log_file = NULL;
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s \"<prompt text>\"\n", argv[0]);
+        fprintf(stderr, "Example: %s \"Once upon a time\"\n", argv[0]);
+        return 1;
+    }
+
+    int B = 1;
+    int T = 1024;
 
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    // setup cuBLAS and cuBLASLt
-    cublasCheck(cublasCreate(&cublas_handle));
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    printf("| device                | %-50s |\n", deviceProp.name);
-    printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
-    printf("+-----------------------+----------------------------------------------------+\n");
 
-    // build the GPT-2 model from a checkpoint
+    // build the GPT-2 model
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-    printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
-    printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
-    printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
-    printf("| num_layers L          | %-50d |\n", model.config.num_layers);
-    printf("| num_heads NH          | %-50d |\n", model.config.num_heads);
-    printf("| channels C            | %-50d |\n", model.config.channels);
-    printf("| num_parameters        | %-50zu |\n", model.num_parameters);
-    printf("+-----------------------+----------------------------------------------------+\n");
 
-    DataLoader val_loader;
-    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1);
-    int val_num_batches = val_loader.num_tokens / (B*T);
-    printf("| val_num_batches       | %-50d |\n", val_num_batches);
-    printf("+-----------------------+----------------------------------------------------+\n");
+    // build tokenizer
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
-    float val_loss = 0.0f;
-    struct timespec start, end;
+    // setup for generation
+    unsigned long long rng_state = (long long)time(NULL);
+    float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    dataloader_reset(&val_loader);
-    for (int i = 0; i < val_num_batches; i++) {
-        dataloader_next_batch(&val_loader);
-        gpt2_forward(&model, val_loader.inputs, B, T);
-        val_loss += model.mean_loss;
+    // Read input from command line
+    char input_buffer[MAX_INPUT_LENGTH];
+    strncpy(input_buffer, argv[1], MAX_INPUT_LENGTH - 1);
+    input_buffer[MAX_INPUT_LENGTH - 1] = '\0';
+
+    // Tokenize input using greedy longest-match encoding
+    int input_length = 0;
+    size_t pos = 0;
+    size_t text_len = strlen(input_buffer);
+    
+    // Remove trailing newline
+    if (text_len > 0 && input_buffer[text_len-1] == '\n') {
+        input_buffer[text_len-1] = '\0';
+        text_len--;
     }
-    val_loss /= val_num_batches;
-    cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    printf("val loss %f\n", val_loss);
+    
+    while (pos < text_len && input_length < MAX_INPUT_LENGTH) {
+        // Greedy: try to match the longest token starting at pos
+        int best_token = -1;
+        size_t best_len = 0;
+        
+        // Try all possible lengths from longest to shortest
+        for (size_t len = (text_len - pos) < 20 ? (text_len - pos) : 20; len > 0; len--) {
+            char temp[21];
+            strncpy(temp, input_buffer + pos, len);
+            temp[len] = '\0';
+            
+            // Try to find this substring in the vocabulary
+            for (uint32_t i = 0; i < tokenizer.vocab_size; i++) {
+                if (strcmp(temp, tokenizer.token_table[i]) == 0) {
+                    best_token = i;
+                    best_len = len;
+                    break;
+                }
+            }
+            if (best_token != -1) break;
+        }
+        
+        if (best_token != -1) {
+            gen_tokens[input_length++] = best_token;
+            pos += best_len;
+        } else {
+            // Skip this character if we can't encode it
+            fprintf(stderr, "Warning: Could not encode character at position %zu: '%c'\n", pos, input_buffer[pos]);
+            pos++;
+        }
+    }
 
-    double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("Time: %f ms\n", time_elapsed_s * 1000);
+    if (input_length == 0) {
+        fprintf(stderr, "Error: No tokens were successfully encoded. Check your input.\n");
+        exit(1);
+    }
 
+    // fill rest with EOT
+    for (int i = input_length; i < B * T; i++) {
+        gen_tokens[i] = GPT2_EOT;
+    }
+
+    float temperature = 0.85f;
+    int top_k = 50;
+    int use_greedy = 0;
+    float repetition_penalty = 1.2f;
+    
+    // Print the input tokens first
+    for (int i = 0; i < input_length; i++) {
+        const char* token_str = tokenizer_decode(&tokenizer, gen_tokens[i]);
+        if (token_str != NULL) {
+            printf("%s", token_str);
+        }
+    }
+    fflush(stdout);
+
+    // autoregressive generation
+    int t;
+    int max_tokens = input_length + 50;
+    if (max_tokens > T) max_tokens = T;
+    for (t = input_length; t < max_tokens; t++) {
+        gpt2_forward(&model, gen_tokens, NULL, B, T);
+        
+        float* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+        cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        
+        if (repetition_penalty != 1.0f) {
+            int lookback_window = 20;
+            for (int j = max(input_length, t - lookback_window); j < t; j++) {
+                int token = gen_tokens[j];
+                if (token < model.config.vocab_size) {
+                    if (cpu_logits[token] > 0) {
+                        cpu_logits[token] /= repetition_penalty;
+                    } else {
+                        cpu_logits[token] *= repetition_penalty;
+                    }
+                }
+            }
+        }
+        
+        if (temperature != 1.0f) {
+            float inv_temp = 1.0f / temperature;
+            for (int i = 0; i < model.config.vocab_size; i++) {
+                cpu_logits[i] *= inv_temp;
+            }
+        }
+        
+        int next_token;
+        int min_tokens_before_eot = 40;
+        int max_resample_attempts = 10;
+        
+        bool has_sentence_end = false;
+        if (t > input_length + 10) {
+            for (int j = input_length; j < t; j++) {
+                const char* tok_str = tokenizer_decode(&tokenizer, gen_tokens[j]);
+                if (tok_str != NULL && (strcmp(tok_str, ".") == 0 || strcmp(tok_str, "!") == 0 || strcmp(tok_str, "?") == 0)) {
+                    has_sentence_end = true;
+                    break;
+                }
+            }
+        }
+        
+        for (int attempt = 0; attempt < max_resample_attempts; attempt++) {
+            if (use_greedy) {
+                next_token = sample_argmax(cpu_logits, model.config.vocab_size);
+            } else if (top_k > 0 && top_k < model.config.vocab_size) {
+                float coin = random_f32(&rng_state);
+                next_token = sample_top_k(cpu_logits, model.config.vocab_size, top_k, coin);
+            } else {
+                float coin = random_f32(&rng_state);
+                next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+            }
+            
+            if (next_token == GPT2_EOT) {
+                if (t - input_length < min_tokens_before_eot || !has_sentence_end) {
+                    continue;
+                }
+            }
+            break;
+        }
+        
+        gen_tokens[t] = next_token;
+        
+        if (next_token == GPT2_EOT) {
+            printf("\n");
+            break; 
+        }
+        
+        const char* token_str = tokenizer_decode(&tokenizer, next_token);
+        if (token_str != NULL) {
+            printf("%s", token_str);
+            fflush(stdout);
+        }
+    }
+    
+    printf("\n");
+
+    // cleanup
+    tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    dataloader_free(&val_loader);
+    free(cpu_logits);
+    free(gen_tokens);
+    
+    return 0;
 }
-// #endif

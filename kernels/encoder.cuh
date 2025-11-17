@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 
-#define ENCODER_BLOCK_SIZE 128
+#define ENCODER_BLOCK_SIZE 768
 
 // Implement this
 __global__ void encoder_forward_kernel(float* out, const int* inp,

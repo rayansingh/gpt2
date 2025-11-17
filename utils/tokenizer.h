@@ -91,6 +91,17 @@ const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
     }
 }
 
+uint32_t tokenizer_encode(Tokenizer *tokenizer, char *token) {
+    while (isspace(*token)) { token++; }
+    while (isspace(token[strlen(token) - 1])) { token[strlen(token) - 1] = '\0'; }
+    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        if (strcmp(token,tokenizer->token_table[i]) == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
 void tokenizer_free(Tokenizer *tokenizer) {
     if (tokenizer->init_ok) {
         for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
