@@ -546,7 +546,7 @@ int main(int argc, char *argv[]) {
     }
 
     int B = 1;
-    int T = 1024;
+    int T = 8192;
 
     // set up the device
     int deviceIdx = 0;
@@ -627,6 +627,7 @@ int main(int argc, char *argv[]) {
     int top_k = 50;
     int use_greedy = 0;
     float repetition_penalty = 1.2f;
+    float eot_confidence_threshold = 15.0f;
     
     // Print the input tokens first
     for (int i = 0; i < input_length; i++) {
@@ -639,7 +640,7 @@ int main(int argc, char *argv[]) {
 
     // autoregressive generation
     int t;
-    int max_tokens = input_length + 50;
+    int max_tokens = input_length + 500;
     if (max_tokens > T) max_tokens = T;
     for (t = input_length; t < max_tokens; t++) {
         gpt2_forward(&model, gen_tokens, NULL, B, T);
@@ -669,7 +670,7 @@ int main(int argc, char *argv[]) {
         }
         
         int next_token;
-        int min_tokens_before_eot = 40;
+        int min_tokens_before_eot = 750;
         int max_resample_attempts = 10;
         
         bool has_sentence_end = false;
@@ -695,11 +696,39 @@ int main(int argc, char *argv[]) {
             }
             
             if (next_token == GPT2_EOT) {
-                if (t - input_length < min_tokens_before_eot || !has_sentence_end) {
+                if (t - input_length < min_tokens_before_eot) {
+                    continue;
+                }
+                
+                float max_other_logit = -FLT_MAX;
+                for (int i = 0; i < model.config.vocab_size; i++) {
+                    if (i != GPT2_EOT && cpu_logits[i] > max_other_logit) {
+                        max_other_logit = cpu_logits[i];
+                    }
+                }
+                
+                float eot_advantage = cpu_logits[GPT2_EOT] - max_other_logit;
+                if (eot_advantage < eot_confidence_threshold) {
+                    continue;
+                }
+                
+                if (!has_sentence_end) {
                     continue;
                 }
             }
             break;
+        }
+        
+        if (next_token == GPT2_EOT && t - input_length < min_tokens_before_eot) {
+            float best_logit = -FLT_MAX;
+            int best_token = 0;
+            for (int i = 0; i < model.config.vocab_size; i++) {
+                if (i != GPT2_EOT && cpu_logits[i] > best_logit) {
+                    best_logit = cpu_logits[i];
+                    best_token = i;
+                }
+            }
+            next_token = best_token;
         }
         
         gen_tokens[t] = next_token;

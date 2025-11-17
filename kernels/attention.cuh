@@ -4,12 +4,9 @@
 #include <cuda_runtime.h>
 #include "softmax.cuh"
 
-#include "../cpu_kernels/attention.cuh"
-
 // Implement this
 
 #define BMM_TILE_WIDTH 32
-#define MAX_SEQUENCE_LENGTH 1024
 
 // B = block size
 // N = seq length
