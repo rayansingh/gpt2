@@ -339,9 +339,10 @@ int main() {
     cudaMemcpy(softmax_inp_gpu_d, softmax_inp_gpu, B * NH * T * T * sizeof(float), cudaMemcpyHostToDevice);
 
     // Call GPU kernel
-    int softmax_block_size = 256;
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    softmax_forward_kernel<<<grid_size, softmax_block_size>>>(softmax_out_gpu_d, scale, softmax_inp_gpu_d, B * NH, T);
+    // int softmax_block_size = 256;
+    // int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+    // softmax_forward_kernel<<<grid_size, softmax_block_size>>>(softmax_out_gpu_d, scale, softmax_inp_gpu_d, B * NH, T);
+    softmax_forward(softmax_out_gpu_d, scale, softmax_inp_gpu_d, B*NH, T);
     cudaCheck(cudaGetLastError());
     cudaDeviceSynchronize();
 
